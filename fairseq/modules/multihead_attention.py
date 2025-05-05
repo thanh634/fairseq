@@ -24,6 +24,17 @@ from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
 from fairseq.models.fairseq_incremental_decoder import FairseqIncrementalDecoder
 
+import logging
+import os
+import sys
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=os.environ.get("LOGLEVEL", "INFO").upper(),
+    stream=sys.stdout,
+)
+logger = logging.getLogger("multihead_attention")
 
 # TODO: move this into xformers?
 # TODO: uint8 input type should just output a bool
@@ -93,6 +104,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
     ):
         super().__init__(dictionary)
 
+        # logger.info("Muiltihead Attention Init\n")
+
         xformers_att_config = utils.eval_str_dict(xformers_att_config)
         self.use_xformers = xformers_att_config is not None
         if self.use_xformers and not _xformers_available:
@@ -143,6 +156,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         self.add_zero_attn = add_zero_attn
         self.beam_size = 1
         self.reset_parameters()
+
+        logger.info("self.use_xformers : {}".format(self.use_xformers))
 
         if self.use_xformers:
             xformers_att_config["dropout"] = xformers_att_config.get("dropout", dropout)
@@ -378,6 +393,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         attn_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
 
+        logger.info("_xformers_attn_forward")
+
         tgt_len, bsz, embed_dim = query.size()
 
         if key_padding_mask is not None:
@@ -449,6 +466,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
             if self.attention.supports_key_padding_mask:
                 kwargs["key_padding_mask"] = key_padding_mask
 
+        logger.info("self.attention : {}".format(self.attention))
+
         y = self.attention(q, k, v, **kwargs)
 
         y = (
@@ -498,6 +517,7 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         """
         if need_head_weights:
             need_weights = True
+        # logger.info("Muiltihead Attention Forward\n")
 
         is_tpu = query.device.type == "xla"
 
@@ -530,12 +550,15 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         ):
             assert key is not None and value is not None
 
+            # logger.info(self.use_xformers)
+            
             if self.use_xformers:
                 return self._xformers_attn_forward(
                     query, key, value, key_padding_mask, need_weights, attn_mask
                 )
 
             else:
+                # logger.info("multi_head_attention_forward in functional")
                 return F.multi_head_attention_forward(
                     query,
                     key,
@@ -559,6 +582,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
                     k_proj_weight=self.k_proj.weight,
                     v_proj_weight=self.v_proj.weight,
                 )
+        
+            # logger.info("multi_head_attention_forward not in functional")
 
         if incremental_state is not None:
             saved_state = self._get_input_buffer(incremental_state)
@@ -570,6 +595,10 @@ class MultiheadAttention(FairseqIncrementalDecoder):
                     key = value = None
         else:
             saved_state = None
+        
+        logger.info("self.num_head = {}".format(self.num_heads))
+        logger.info("self.self_attention = {}".format(self.self_attention))
+        logger.info("self.encoder_decoder_attention = {} \n".format(self.encoder_decoder_attention))
 
         if self.self_attention:
             q = self.q_proj(query)

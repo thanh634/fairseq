@@ -5,13 +5,23 @@
 #
 
 import math
-
+import logging
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.scalar_bias import scalar_bias
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=os.environ.get("LOGLEVEL", "INFO").upper(),
+    stream=sys.stdout,
+)
+logger = logging.getLogger("downsampled_multihead_attention")
 
 
 class SingleHeadAttention(nn.Module):
@@ -117,6 +127,8 @@ class SingleHeadAttention(nn.Module):
             k = k.view(src_len, size, self.head_dim)
             v = v.view(src_len, size, self.head_dim)
 
+        logger.info("(q, k ,v) = {}".format((q, k ,v)))
+
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
         v = v.transpose(0, 1)
@@ -164,6 +176,8 @@ class SingleHeadAttention(nn.Module):
             attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
 
         attn = self.out_proj(attn)
+
+        logger.info("(attn, attn_weights) = {}".format((attn, attn_weights)))
 
         return attn, attn_weights
 
@@ -282,6 +296,9 @@ class DownsampledMultiHeadAttention(nn.ModuleList):
                 bsz, self.num_heads, tgt_size, src_len
             )
             full_attn_weights = full_attn_weights.sum(dim=1) / self.num_heads
+
+            logger.info("full_attn_weights is {}".format(full_attn_weights))
+            
             return full_attn, full_attn_weights
 
 
