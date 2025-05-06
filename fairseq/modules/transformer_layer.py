@@ -15,6 +15,17 @@ from fairseq.modules import LayerNorm, MultiheadAttention
 from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
 
+import logging
+import os
+import sys
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=os.environ.get("LOGLEVEL", "INFO").upper(),
+    stream=sys.stdout,
+)
+logger = logging.getLogger("transformer_layer")
 
 class TransformerEncoderLayerBase(nn.Module):
     """Encoder layer block.
@@ -66,7 +77,7 @@ class TransformerEncoderLayerBase(nn.Module):
         )
 
         self.final_layer_norm = LayerNorm(self.embed_dim, export=cfg.export)
-
+        logger.info("TransformerEncoderLayerBase init")
     def build_fc1(self, input_dim, output_dim, q_noise, qn_block_size):
         return quant_noise(
             nn.Linear(input_dim, output_dim), p=q_noise, block_size=qn_block_size
@@ -186,6 +197,8 @@ class TransformerEncoderLayerBase(nn.Module):
         # Note that we cannot use -inf here, because at some edge cases,
         # the attention weight (before softmax) for some padded element in query
         # will become -inf, which results in NaN in model parameters
+
+        logger.info("TransformerEncoderLayerBase foward")
         if attn_mask is not None:
             attn_mask = attn_mask.masked_fill(
                 attn_mask.to(torch.bool), -1e8 if x.dtype == torch.float32 else -1e4
@@ -231,8 +244,10 @@ class TransformerEncoderLayer(TransformerEncoderLayerBase):
     def __init__(self, args):
         super().__init__(TransformerConfig.from_namespace(args))
         self.args = args
+        logger.info("TransformerEncoderLayer init")
 
     def build_self_attention(self, embed_dim, args):
+        logger.info("TransformerEncoderLayer build_self_attention")
         return super().build_self_attention(
             embed_dim, TransformerConfig.from_namespace(args)
         )
@@ -259,6 +274,8 @@ class TransformerDecoderLayerBase(nn.Module):
         self, cfg, no_encoder_attn=False, add_bias_kv=False, add_zero_attn=False
     ):
         super().__init__()
+        logger.info("TransformerDecoderLayerBase __init__")
+
         self.embed_dim = cfg.decoder.embed_dim
         self.dropout_module = FairseqDropout(
             cfg.dropout, module_name=self.__class__.__name__
@@ -350,6 +367,7 @@ class TransformerDecoderLayerBase(nn.Module):
     def build_self_attention(
         self, embed_dim, cfg, add_bias_kv=False, add_zero_attn=False
     ):
+        logger.info("TransformerDecoderLayerBase build_self_attention")
         return MultiheadAttention(
             embed_dim,
             cfg.decoder.attention_heads,
@@ -363,6 +381,7 @@ class TransformerDecoderLayerBase(nn.Module):
         )
 
     def build_encoder_attention(self, embed_dim, cfg):
+        logger.info("TransformerDecoderLayerBase build_encoder_attention")
         return MultiheadAttention(
             embed_dim,
             cfg.decoder.attention_heads,
@@ -409,6 +428,7 @@ class TransformerDecoderLayerBase(nn.Module):
         """
         if need_head_weights:
             need_attn = True
+        logger.info("TransformerDecoderLayerBase forward")
 
         residual = x
         if self.normalize_before:

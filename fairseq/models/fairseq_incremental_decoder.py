@@ -43,7 +43,7 @@ class FairseqIncrementalDecoder(FairseqDecoder):
     def forward(
         self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs
     ):
-        logger.info("FairseqIncrementalDecoder forward")
+        logger.info(" -- FairseqIncrementalDecoder forward")
         """
         Args:
             prev_output_tokens (LongTensor): shifted output tokens of shape

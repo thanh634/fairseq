@@ -13,6 +13,17 @@ from torch.nn import Parameter
 from fairseq.modules.multihead_attention import MultiheadAttention
 from ..modules.multihead_functional import multi_head_attention_forward
 
+import logging
+import os
+import sys
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=os.environ.get("LOGLEVEL", "INFO").upper(),
+    stream=sys.stdout,
+)
+logger = logging.getLogger("multihead_attention_selection")
 
 class MultiheadAttentionSelection(MultiheadAttention):
 
@@ -67,6 +78,7 @@ class MultiheadAttentionSelection(MultiheadAttention):
         else:
             self.bias_k = self.bias_v = None
         self.reset_parameters()
+        logger.info("MultiheadAttentionSelection INIT")
 
     def forward(
         self,
@@ -85,6 +97,7 @@ class MultiheadAttentionSelection(MultiheadAttention):
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if need_head_weights:
             need_weights = True
+        logger.info("MultiheadAttentionSelection FORWARD")
 
         is_tpu = query.device.type == "xla"
 
