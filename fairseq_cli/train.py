@@ -7,21 +7,30 @@
 Train a new model on one or across multiple GPUs.
 """
 
+import torch
 import argparse
+
+torch.serialization.add_safe_globals([argparse.Namespace])
 import logging
 import math
 import os
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# We need to setup root logger before importing any fairseq libraries.
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=os.environ.get("LOGLEVEL", "INFO").upper(),
-    stream=sys.stdout,
-)
+log_filename = "train.log"
+file_handler = logging.FileHandler(log_filename)
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    "%Y-%m-%d %H:%M:%S",
+))
+
+# Add the file handler to the 'fairseq_cli.train' logger
 logger = logging.getLogger("fairseq_cli.train")
+logger.addHandler(file_handler)
+
+# Optional: add to root logger to capture everything
+logging.getLogger().addHandler(file_handler)
+
 
 import numpy as np
 import torch
