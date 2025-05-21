@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn import Parameter
 
+from fairseq.modules.custom_function.selective_attention import SelectiveAttention
+
 try:
     from xformers.components.attention import build_attention
     from xformers.components.attention.utils import maybe_merge_masks
@@ -174,7 +176,7 @@ class MultiheadAttention(FairseqIncrementalDecoder):
             self.attention = build_attention(xformers_att_config)
 
         self.onnx_trace = False
-        self.skip_embed_dim_check = False
+        self.skip_embed_dim_check = True
         self.selective_attention = SelectiveAttention(self.head_dim, dropout)
         self.init_incremental_state()
 
@@ -670,6 +672,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
                 .transpose(0, 1)
             )
 
+        # 4.5 - Concatenate with Previous States (for incremental decoding)
+        # If decoding one token at a time, keys/values from previous steps are accumulated.
         if saved_state is not None:
             # saved states are stored with shape (bsz, num_heads, seq_len, head_dim)
             if "prev_key" in saved_state:
@@ -718,6 +722,7 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         assert k is not None
         assert k.size(1) == src_len
 
+        # 4.6 - Handle Key Padding and Zero Attention (if configured)
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
         if key_padding_mask is not None and key_padding_mask.dim() == 0:
@@ -734,6 +739,10 @@ class MultiheadAttention(FairseqIncrementalDecoder):
                 k=k, v=v, key_padding_mask=key_padding_mask, attn_mask=attn_mask
             )
 
+        # 5 - Compute Attention Scores
+        # Shape: [B * num_heads, tgt_len, src_len]
+        # Computes dot-product attention scores for each query against all keys.
+        
         if self.encoder_decoder_attention and bsz != kv_bsz:
             attn_weights = torch.einsum(
                 "bxhtd,bhsd->bxhts",
@@ -747,6 +756,9 @@ class MultiheadAttention(FairseqIncrementalDecoder):
 
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
+        # 6 - Apply Masks
+        # attn_mask: Optional mask to prevent attention to certain positions (e.g., future tokens).
+        # key_padding_mask: Prevents attention to padding tokens.
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(0)
             if self.onnx_trace:
@@ -775,7 +787,10 @@ class MultiheadAttention(FairseqIncrementalDecoder):
 
         if before_softmax:
             return attn_weights, v
-
+        
+        
+        # 7 - Softmax Over Keys
+        # Converts scores to probabilities.
         attn_weights_float = utils.softmax(
             attn_weights, dim=-1, onnx_trace=self.onnx_trace
         )
@@ -789,6 +804,8 @@ class MultiheadAttention(FairseqIncrementalDecoder):
 
         logger.info("init attn = \n{}".format(attn))
         
+        # 8 - Weighted Sum of Values
+        # Computes final attention output as a weighted sum of values based on attention probabilities.
         if self.encoder_decoder_attention and bsz != kv_bsz:
             attn = torch.einsum(
                 "bxhts,bhsd->bxhtd",
@@ -819,22 +836,29 @@ class MultiheadAttention(FairseqIncrementalDecoder):
             # logger.info("[] : attn before torch.bmm = \n{}".format(attn))
             
             # attn = torch.bmm(attn_probs, v)
-            attn = []  # Accumulate output per head
+            
+            
+            attn = []
+            attn_weights_all = []
             
             for h in range(self.num_heads):
                 start = h * bsz
                 end = (h + 1) * bsz
-                head_q = q[start:end]  # [bsz, tgt_len, head_dim] 
+                head_q = q[start:end]
                 head_k = k[start:end]
                 head_v = v[start:end]
             
-                head_out, _ = self.selective_attention(head_q, head_k, head_v)
+                head_out, head_attn = self.selective_attention(head_q, head_k, head_v)
                 attn.append(head_out)
+                attn_weights_all.append(head_attn)
             
             attn = torch.cat(attn, dim=0)  # [bsz * num_heads, tgt_len, head_dim]
+            attn_weights_float = torch.cat(attn_weights_all, dim=0)  # [bsz * num_heads, tgt_len, src_len]
 
             # logger.info("[] : attn after torch.bmm = \n{}".format(attn))
             
+        # 9 - Reshape and Project Output
+        # Restore to shape [tgt_len, bsz, embed_dim] and apply final projection.
         assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
         if self.onnx_trace and attn.size(1) == 1:
             # when ONNX tracing a single decoder step (sequence length == 1)
@@ -852,6 +876,14 @@ class MultiheadAttention(FairseqIncrementalDecoder):
                 # average attention weights over heads
                 attn_weights = attn_weights.mean(dim=0)
 
+        # Summary: How Attention Is Computed
+        # 1 - Project input into Q, K, V.
+        # 2 - Reshape for multi-head attention.
+        # 3 - Dot-product Q with K → get attention scores.
+        # 4 - Mask attention scores (if needed).
+        # 5 - Softmax scores → attention probabilities.
+        # 6 - Multiply with V → get attention output.
+        # 7 - Concatenate heads, project output.
         return attn, attn_weights
 
     @staticmethod
@@ -981,47 +1013,3 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         for key, value in items_to_add.items():
             state_dict[key] = value
 
-class SelectiveAttention(nn.Module):
-    def __init__(self, head_dim, dropout_prob=0.0, selective=False):
-        super().__init__()
-        self.head_dim = head_dim
-        self.dropout = nn.Dropout(dropout_prob)
-        self.selective = selective
-
-    def forward(self, q, k, v, mask=None):
-        bsz, seq_len, _ = q.size()
-        scale = self.head_dim ** 0.5
-
-        scores = torch.bmm(q, k.transpose(1, 2)) / scale
-
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-
-        if self.selective:
-            # --- Selective Masking ---
-            s = F.relu(scores.clone())
-            s[..., 0] = 0
-
-            if seq_len == k.size(1):
-                eye = torch.eye(seq_len, device=s.device, dtype=s.dtype).unsqueeze(0)
-                s = s * (1 - eye)
-
-            s = torch.roll(s, 1, -2)
-            s[..., 0, :] = 0
-
-            s = torch.cumsum(s, dim=-1)
-            scores = scores - s
-
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Logging stats
-        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
-            logger.warning("⚠️ NaN or Inf detected in attention weights")
-
-        logger.info(f"[Selective={self.selective}] attn_weights stats: "
-                    f"min={attn_weights.min().item():.6f}, max={attn_weights.max().item():.6f}, "
-                    f"mean={attn_weights.mean().item():.6f}")
-
-        output = torch.bmm(attn_weights, v)
-        return output, attn_weights
