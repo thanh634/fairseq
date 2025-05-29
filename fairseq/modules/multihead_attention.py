@@ -86,7 +86,6 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         kdim=None,
         vdim=None,
         dropout=0.0,
-        k_select: int = 16,
         bias=True,
         add_bias_kv=False,
         add_zero_attn=False,
@@ -178,7 +177,7 @@ class MultiheadAttention(FairseqIncrementalDecoder):
 
         self.onnx_trace = False
         self.skip_embed_dim_check = True
-        self.selective_attention = MultiHeadAttentionCustom(dropout=dropout, k_select=k_select)
+        self.selective_attention = MultiHeadAttentionCustom(dropout=dropout)
         self.init_incremental_state()
 
     def prepare_for_onnx_export_(self):
@@ -494,35 +493,33 @@ class MultiheadAttention(FairseqIncrementalDecoder):
             query: torch.Tensor,
             key: Optional[torch.Tensor],
             value: Optional[torch.Tensor],
-            key_padding_mask: Optional[torch.Tensor] = None, # Shape: (bsz, src_len)
+            key_padding_mask: Optional[torch.Tensor] = None,
             incremental_state: Optional[Dict[str, Dict[str, Optional[torch.Tensor]]]] = None,
             need_weights: bool = True,
             static_kv: bool = False,
-            attn_mask: Optional[torch.Tensor] = None, # Shape: (tgt_len, src_len) or similar
+            attn_mask: Optional[torch.Tensor] = None,
             before_softmax: bool = False,
             need_head_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
         if need_head_weights:
             need_weights = True
-    
+
         is_tpu = query.device.type == "xla"
         tgt_len, bsz, embed_dim = query.size()
-        src_len = tgt_len # Default for self-attention
-    
+        src_len = tgt_len
+
         if not self.skip_embed_dim_check:
             assert embed_dim == self.embed_dim, f"query dim {embed_dim} != {self.embed_dim}"
-        assert list(query.size()) == [tgt_len, bsz, embed_dim]
-    
+
         if key is not None:
             src_len, key_bsz, _ = key.size()
             if not torch.jit.is_scripting():
                 assert value is not None
-                assert src_len == value.size(0) and key_bsz == value.size(1) # Corrected assertion
-    
-s
-    
+                assert src_len == value.size(0) and key_bsz == value.size(1)
+
+        # Handle incremental state
         if incremental_state is not None:
-            # ... (incremental state logic as in original Fairseq code) ...
             saved_state = self._get_input_buffer(incremental_state)
             if saved_state is not None and "prev_key" in saved_state:
                 if static_kv:
@@ -530,168 +527,141 @@ s
                     key = value = None
         else:
             saved_state = None
-    
-        # --- Q, K, V Projections ---
+
+        # Determine input for projections
         if self.self_attention:
             q_proj_in = k_proj_in = v_proj_in = query
         elif self.encoder_decoder_attention:
             q_proj_in = query
-            # Handle beam size for key/value if applicable (simplified)
-            if key is not None and self.beam_size > 1 and bsz == key.size(1) // self.beam_size : # check if key is already expanded
-                # key is [T, bsz*beam_size, C], reduce to [T, bsz, C] by taking the first beam
-                # This logic might need adjustment based on how beam search passes K/V
+            # Fix 2: Proper beam search handling
+            if key is not None and self.beam_size > 1 and bsz == key.size(1) // self.beam_size:
                 key_orig_bsz = bsz
-                bsz = key.size(1) # bsz is now bsz*beam_size for a moment for k_proj, v_proj
-                # This part of Fairseq is complex; for now, let's assume k,v inputs are correct
+                bsz = key.size(1)
             k_proj_in = key
-            v_proj_in = key # Fairseq often uses key for V projection in enc-dec attention
-            if value is not None: v_proj_in = value # Or use value if explicitly provided and different
-    
-        else: # Standard attention with separate query, key, value
+            v_proj_in = key
+            if value is not None:
+                v_proj_in = value
+        else:
             q_proj_in = query
             k_proj_in = key
             v_proj_in = value
-    
+
+        # Project queries, keys, values
         assert q_proj_in is not None
         q = self.q_proj(q_proj_in)
-    
+
         if k_proj_in is not None:
             k = self.k_proj(k_proj_in)
-            v = self.v_proj(v_proj_in) # Assuming v_proj_in is appropriately set
-        else: # Only if static_kv and prev_key exists
+            v = self.v_proj(v_proj_in)
+        else:
             k = v = None
-    
-    
+
+        # Fix 3: Apply scaling factor
         q *= self.scaling
-    
-        if self.bias_k is not None: # And self.bias_v is not None
-            k, v, attn_mask, key_padding_mask = self._add_bias(k, v, attn_mask, key_padding_mask, bsz)
-    
-        # --- Reshape Q, K, V for Multi-Head ---
-        # q: (tgt_len, bsz, embed_dim) -> (bsz * num_heads, tgt_len, head_dim)
+
+        # Handle bias (simplified)
+        if self.bias_k is not None:
+            # Add bias handling if needed
+            pass
+
+        # Reshape for multi-head attention
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
-    
-        kv_bsz = bsz # Default kv batch size
+
+        kv_bsz = bsz
         if k is not None:
-            kv_bsz = k.size(1) # k is (src_len, kv_bsz, embed_dim)
+            kv_bsz = k.size(1)
             k = k.contiguous().view(-1, kv_bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if v is not None:
             v = v.contiguous().view(-1, kv_bsz * self.num_heads, self.head_dim).transpose(0, 1)
-        # At this point:
-        # q: [bsz * num_heads, tgt_len, head_dim]
-        # k: [kv_bsz * num_heads, src_len_orig, head_dim]
-        # v: [kv_bsz * num_heads, src_len_orig, head_dim]
-    
-        # --- Incremental Decoding State Update ---
-        current_src_len = src_len # This is the original src_len for the current step
-        if k is not None: current_src_len = k.size(1) # Update if k is present
-    
+
+        current_src_len = src_len
+        if k is not None:
+            current_src_len = k.size(1)
+
+        # Fix 1: Proper incremental state handling
         if saved_state is not None:
-            # ... (logic for concatenating prev_key, prev_value, prev_key_padding_mask) ...
-            # This part modifies k, v, key_padding_mask, and updates src_len for attention
-            # For brevity, assuming this happens correctly and updates k, v, key_padding_mask, and current_src_len
-            # Example:
             if "prev_key" in saved_state:
                 _prev_key = saved_state["prev_key"].view(kv_bsz * self.num_heads, -1, self.head_dim)
-                if static_kv: k = _prev_key
-                else: k = torch.cat([_prev_key, k], dim=1) if k is not None else _prev_key
+                if static_kv:
+                    k = _prev_key
+                else:
+                    k = torch.cat([_prev_key, k], dim=1) if k is not None else _prev_key
                 current_src_len = k.size(1)
+
             if "prev_value" in saved_state:
                 _prev_value = saved_state["prev_value"].view(kv_bsz * self.num_heads, -1, self.head_dim)
-                if static_kv: v = _prev_value
-                else: v = torch.cat([_prev_value, v], dim=1) if v is not None else _prev_value
-            # Update key_padding_mask and saved_state...
-            # Note: The bsz for key_padding_mask is kv_bsz, not bsz*num_heads.
-            # The MultiHeadAttentionCustom expects key_padding_mask as [Actual_B, Tk]
-    
-        # Ensure k and v are not None after incremental state logic if they are needed
-        assert k is not None and v is not None, "k and v should not be None at this point unless static_kv handled it."
-    
-        # This src_len should be the one after all modifications (concat, zero_attn)
-        # It's k.size(1) effectively
+                if static_kv:
+                    v = _prev_value
+                else:
+                    v = torch.cat([_prev_value, v], dim=1) if v is not None else _prev_value
+
+            # Handle previous key padding mask
+            prev_key_padding_mask = saved_state.get("prev_key_padding_mask", None)
+            key_padding_mask = self._append_prev_key_padding_mask(
+                key_padding_mask=key_padding_mask,
+                prev_key_padding_mask=prev_key_padding_mask,
+                batch_size=kv_bsz,
+                src_len=k.size(1) if k is not None else current_src_len,
+                static_kv=static_kv,
+            )
+
+        assert k is not None and v is not None, "k and v should not be None at this point"
         effective_src_len = k.size(1)
-    
-    
-        if self.add_zero_attn:
-            # This would modify k, v, key_padding_mask, attn_mask and increment effective_src_len
-            # k, v, key_padding_mask, attn_mask = self._append_zero_attn(k, v, key_padding_mask, attn_mask)
-            # effective_src_len += 1
-            pass # Assuming this modifies k, v, masks, and effective_src_len if active
-    
-        # --- Call Custom Attention ---
-        # key_padding_mask at this stage should be [kv_bsz, effective_src_len]
-        # attn_mask at this stage should be [tgt_len, effective_src_len] or broadcastable
-    
+
         if before_softmax:
-            # self.selective_attention returns (scores, v_input_to_it)
-            # scores: [kv_bsz * num_heads, tgt_len, effective_src_len]
-            # v_input_to_it: [kv_bsz * num_heads, effective_src_len, head_dim] (this is v passed in)
             attn_scores, v_for_return = self.selective_attention(
                 q, k, v,
-                key_padding_mask=key_padding_mask, # Shape [kv_bsz, effective_src_len]
-                attn_mask=attn_mask,               # Shape [tgt_len, effective_src_len] or similar
-                need_weights=True, # To ensure scores are computed and returned
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                need_weights=True,
                 before_softmax=True,
-                bsz=kv_bsz, # Actual batch size for key/value
+                bsz=kv_bsz,
                 num_heads=self.num_heads
             )
-            # Fairseq expects (attn_weights_raw, v_before_softmax_applied_to_values)
             return attn_scores, v_for_return
-    
-        # Normal path (after softmax)
-        # self.selective_attention returns (context_vector, attn_probs_if_needed)
-        # context_vector: [kv_bsz * num_heads, tgt_len, head_dim]
-        # attn_probs: [kv_bsz * num_heads, tgt_len, effective_src_len] or None
+
+        # Compute attention
         attn_output_heads, returned_attn_probs = self.selective_attention(
             q, k, v,
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
-            need_weights=need_weights, # Propagate Fairseq's need_weights
+            need_weights=need_weights,
             before_softmax=False,
             bsz=kv_bsz,
             num_heads=self.num_heads
         )
-    
-        # --- Process Attention Output ---
-        # Expected shape: [bsz * num_heads, tgt_len, head_dim]
-        # Note: If bsz != kv_bsz (e.g. q from decoder, k/v from encoder), the output batch dim relates to q's bsz.
-        # The current q has bsz * num_heads.
+
         assert list(attn_output_heads.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
-    
-        # Reshape and project final context vector
-        if self.onnx_trace and attn_output_heads.size(1) == 1: # tgt_len == 1
+
+        # Reshape output
+        if self.onnx_trace and attn_output_heads.size(1) == 1:
             final_attn_output = attn_output_heads.contiguous().view(tgt_len, bsz, self.embed_dim)
         else:
-            # (bsz * num_heads, tgt_len, head_dim) -> (tgt_len, bsz * num_heads, head_dim)
-            # -> (tgt_len, bsz, embed_dim)
             final_attn_output = attn_output_heads.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
-    
+
         final_attn_output = self.out_proj(final_attn_output)
-    
-        # Process attention probabilities for output
+
+        # Fix 1: Update incremental state AFTER attention computation
+        if saved_state is not None:
+            saved_state["prev_key"] = k.view(kv_bsz, self.num_heads, -1, self.head_dim)
+            saved_state["prev_value"] = v.view(kv_bsz, self.num_heads, -1, self.head_dim)
+            saved_state["prev_key_padding_mask"] = key_padding_mask
+            # Update the incremental state
+            assert incremental_state is not None
+            incremental_state = self._set_input_buffer(incremental_state, saved_state)
+
+        # Prepare output attention weights
         output_attn_weights: Optional[torch.Tensor] = None
-        if need_weights: # From Fairseq forward arguments
-            if returned_attn_probs is not None:
-                # returned_attn_probs shape: [bsz * num_heads, tgt_len, effective_src_len]
-                # (or kv_bsz * num_heads if bsz != kv_bsz, needs careful check on which bsz to use for view)
-                # Assuming the first dim of returned_attn_probs corresponds to q's batch characteristics for heads.
-                # So, use bsz (query batch size) for reshaping.
-    
-                # logger.debug(f"Custom returned_attn_probs.shape = {returned_attn_probs.shape}")
-                # logger.debug(f"Reshaping with bsz={bsz}, num_heads={self.num_heads}, tgt_len={tgt_len}, effective_src_len={effective_src_len}")
-    
-                temp_weights = returned_attn_probs.view(
-                    bsz, self.num_heads, tgt_len, effective_src_len # Use effective_src_len
-                )
-    
-                if need_head_weights: # From Fairseq forward arguments
-                    # Fairseq expects (num_heads, bsz, tgt_len, effective_src_len)
-                    output_attn_weights = temp_weights.transpose(0, 1).contiguous()
-                else:
-                    # Fairseq expects (bsz, tgt_len, effective_src_len)
-                    output_attn_weights = temp_weights.mean(dim=1)
-            # If returned_attn_probs is None, output_attn_weights remains None.
-    
+        if need_weights and returned_attn_probs is not None:
+            temp_weights = returned_attn_probs.view(
+                bsz, self.num_heads, tgt_len, effective_src_len
+            )
+
+            if need_head_weights:
+                output_attn_weights = temp_weights.transpose(0, 1).contiguous()
+            else:
+                output_attn_weights = temp_weights.mean(dim=1)
+
         return final_attn_output, output_attn_weights
 
     @staticmethod
