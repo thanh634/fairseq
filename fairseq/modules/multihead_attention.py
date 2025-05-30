@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn import Parameter
 
-from fairseq.modules.custom_function.selective_attention import MultiHeadAttentionCustom
+from fairseq.modules.custom_function.selective_attention import MultiHeadAttentionSelective
 
 try:
     from xformers.components.attention import build_attention
@@ -177,7 +177,12 @@ class MultiheadAttention(FairseqIncrementalDecoder):
 
         self.onnx_trace = False
         self.skip_embed_dim_check = True
-        self.selective_attention = MultiHeadAttentionCustom(dropout=dropout)
+        self.selective_attention = MultiHeadAttentionSelective(
+            dropout=dropout,
+            k_select=64,        # Start with 64 - reasonable for most sentences
+            adaptive_k=True,    # Adapt based on length
+            min_k_ratio=0.3     # Keep at least 30% - important for translation
+        )
         self.init_incremental_state()
 
     def prepare_for_onnx_export_(self):
