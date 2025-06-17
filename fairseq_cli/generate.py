@@ -11,6 +11,7 @@ import ast
 import logging
 import math
 import os
+import io
 import sys
 from argparse import Namespace
 from itertools import chain
@@ -24,6 +25,7 @@ from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.logging import progress_bar
 from fairseq.logging.meters import StopwatchMeter, TimeMeter
 
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def main(cfg: DictConfig):
 

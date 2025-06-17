@@ -10,9 +10,9 @@ REM_NON_PRINT_CHAR=$SCRIPTS/tokenizer/remove-non-printing-char.perl
 BPEROOT=subword-nmt/subword_nmt
 BPE_TOKENS=10000
 
-src=en
-tgt=vi
-lang=en-vi
+src=vi
+tgt=en
+lang=vi-en
 prep=iwslt15.tokenized.$lang
 orig=orig/$lang
 tmp=$prep/tmp
